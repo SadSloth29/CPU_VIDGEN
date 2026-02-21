@@ -2,12 +2,12 @@
 import math
 
 import torch
-
+import torch.cuda.amp as amp
 import torch.nn as nn
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 
-from .attention import attention as flash_attention
+from .attention import flash_attention
 
 __all__ = ['WanModel']
 
@@ -28,7 +28,7 @@ def sinusoidal_embedding_1d(dim, position):
     return x
 
 
-
+@amp.autocast(enabled=False)
 def rope_params(max_seq_len, dim, theta=10000):
     assert dim % 2 == 0
     freqs = torch.outer(
@@ -39,7 +39,7 @@ def rope_params(max_seq_len, dim, theta=10000):
     return freqs
 
 
-
+@amp.autocast(enabled=False)
 def rope_apply(x, grid_sizes, freqs):
     n, c = x.size(2), x.size(3) // 2
 
@@ -294,23 +294,23 @@ class WanAttentionBlock(nn.Module):
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
         assert e.dtype == torch.float32
-        
-        e = (self.modulation + e).chunk(6, dim=1)
-        
+        with amp.autocast(dtype=torch.float32):
+            e = (self.modulation + e).chunk(6, dim=1)
+        assert e[0].dtype == torch.float32
 
         # self-attention
         y = self.self_attn(
             self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, grid_sizes,
             freqs)
-       
-        x = x + y * e[2]
+        with amp.autocast(dtype=torch.float32):
+            x = x + y * e[2]
 
         # cross-attention & ffn function
         def cross_attn_ffn(x, context, context_lens, e):
             x = x + self.cross_attn(self.norm3(x), context, context_lens)
             y = self.ffn(self.norm2(x).float() * (1 + e[4]) + e[3])
-           
-            x = x + y * e[5]
+            with amp.autocast(dtype=torch.float32):
+                x = x + y * e[5]
             return x
 
         x = cross_attn_ffn(x, context, context_lens, e)
@@ -341,9 +341,9 @@ class Head(nn.Module):
             e(Tensor): Shape [B, C]
         """
         assert e.dtype == torch.float32
-        
-        e = (self.modulation + e.unsqueeze(1)).chunk(2, dim=1)
-        x = (self.head(self.norm(x) * (1 + e[1]) + e[0]))
+        with amp.autocast(dtype=torch.float32):
+            e = (self.modulation + e.unsqueeze(1)).chunk(2, dim=1)
+            x = (self.head(self.norm(x) * (1 + e[1]) + e[0]))
         return x
 
 
@@ -532,21 +532,62 @@ class WanModel(ModelMixin, ConfigMixin):
 
         # embeddings
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
+
         grid_sizes = torch.stack(
-            [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
+            [torch.tensor(u.shape[2:], dtype=torch.long, device=x[0].device) for u in x])
+
         x = [u.flatten(2).transpose(1, 2) for u in x]
-        seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
-        assert seq_lens.max() <= seq_len
+
+        # ===== MERGING BLOCK STARTS HERE =====
+        new_x = []
+        new_grid_sizes = []
+        new_seq_lens = []
+
+        for u, grid in zip(x, grid_sizes):
+            B, L, D = u.shape
+            F_p, H_p, W_p = grid.tolist()
+
+            # Restore 3D
+            u = u.view(B, F_p, H_p, W_p, D)
+
+            usable_F = (F_p // 4) * 4
+
+            if usable_F == 0:
+                merged = u
+                new_F_p = F_p
+            else:
+                u = u[:, :usable_F]
+                u = u.view(B, usable_F // 4, 4, H_p, W_p, D)
+
+                # first + last averaging
+                merged = 0.5 * u[:, :, 0] + 0.5 * u[:, :, -1]
+
+                new_F_p = usable_F // 4
+
+            merged = merged.view(B, new_F_p * H_p * W_p, D)
+
+            new_x.append(merged)
+            new_grid_sizes.append(
+                torch.tensor([new_F_p, H_p, W_p], device=merged.device)
+            )
+            new_seq_lens.append(merged.size(1))
+
         x = torch.cat([
-            torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))],
-                      dim=1) for u in x
+            torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))], dim=1)
+            for u in new_x
         ])
 
-        # time embeddings
+        grid_sizes = torch.stack(new_grid_sizes)
+        seq_lens = torch.tensor(new_seq_lens, dtype=torch.long, device=x.device)
+
         
-        e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t).float())
-        e0 = self.time_projection(e).unflatten(1, (6, self.dim))
-        assert e.dtype == torch.float32 and e0.dtype == torch.float32
+
+        # time embeddings
+        with amp.autocast(dtype=torch.float32):
+            e = self.time_embedding(
+                sinusoidal_embedding_1d(self.freq_dim, t).float())
+            e0 = self.time_projection(e).unflatten(1, (6, self.dim))
+            assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
         # context
         context_lens = None

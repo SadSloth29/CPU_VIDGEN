@@ -18,6 +18,7 @@ from .distributed.fsdp import shard_model
 from .modules.model import WanModel
 from .modules.t5 import QuantizedT5EncoderModel
 from .modules.vae import WanVAE
+from .modules.t_vae import TAEW2_1DiffusersWrapper
 from .utils.fm_solvers import (
     FlowDPMSolverMultistepScheduler,
     get_sampling_sigmas,
@@ -38,6 +39,7 @@ class WanT2V:
         dit_fsdp=False,
         use_usp=False,
         t5_cpu=False,
+        quantized_weights_dir = None
     ):
         r"""
         Initializes the Wan text-to-video generation model components.
@@ -60,7 +62,7 @@ class WanT2V:
             t5_cpu (`bool`, *optional*, defaults to False):
                 Whether to place T5 model on CPU. Only works without t5_fsdp.
         """
-        self.device = torch.device(f"cuda:{device_id}")
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.config = config
         self.rank = rank
         self.t5_cpu = t5_cpu
@@ -88,7 +90,7 @@ class WanT2V:
             )
         else:
             shard_fn = partial(shard_model, device_id=device_id)
-            self.text_encoder = T5EncoderModel(
+            self.text_encoder = QuantizedT5EncoderModel(
                 text_len=config.text_len,
                 dtype=config.t5_dtype,
                 device=torch.device('cpu'),
@@ -102,10 +104,21 @@ class WanT2V:
         self.vae = WanVAE(
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
             device=self.device)
+        self.vaeT = TAEW2_1DiffusersWrapper().to(self.device)
+        
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
-        self.model = WanModel.from_pretrained(checkpoint_dir)
+        self.model = WanModel.from_pretrained(checkpoint_dir,weights_only=False)
         self.model.eval().requires_grad_(False)
+        state_dict = torch.load(quantized_weights_dir, map_location=self.device)
+        original_dtypes = {k: v.dtype for k, v in self.model.state_dict().items()}
+        for key in state_dict:
+            if state_dict[key].dtype == torch.int8:
+                target_dtype = original_dtypes.get(key, torch.float16)
+                state_dict[key] = state_dict[key].to(target_dtype)
+
+        self.model.load_state_dict(state_dict)
+        self.model.to(self.device)
 
         if use_usp:
             from xfuser.core.distributed import get_sequence_parallel_world_size
@@ -278,7 +291,7 @@ class WanT2V:
                 self.model.cpu()
                 torch.cuda.empty_cache()
             if self.rank == 0:
-                videos = self.vae.decode(x0)
+                videos = self.vaeT.decode(x0)
 
         del noise, latents
         del sample_scheduler

@@ -24,7 +24,7 @@ from .modules.vace_model import VaceWanModel
 from .text2video import (
     FlowDPMSolverMultistepScheduler,
     FlowUniPCMultistepScheduler,
-    T5EncoderModel,
+    QuantizedT5EncoderModel,
     WanT2V,
     WanVAE,
     get_sampling_sigmas,
@@ -76,14 +76,26 @@ class WanVace(WanT2V):
         self.num_train_timesteps = config.num_train_timesteps
         self.param_dtype = config.param_dtype
 
-        shard_fn = partial(shard_model, device_id=device_id)
-        self.text_encoder = T5EncoderModel(
-            text_len=config.text_len,
-            dtype=config.t5_dtype,
-            device=torch.device('cpu'),
-            checkpoint_path=os.path.join(checkpoint_dir, config.t5_checkpoint),
-            tokenizer_path=os.path.join(checkpoint_dir, config.t5_tokenizer),
-            shard_fn=shard_fn if t5_fsdp else None)
+        if t5_cpu:
+            self.text_encoder = QuantizedT5EncoderModel(
+                text_len=config.text_len,
+                model_path=os.path.join(checkpoint_dir, config.t5_checkpoint),
+                tokenizer_path=os.path.join(checkpoint_dir, config.t5_tokenizer),
+                n_ctx=config.text_len,
+                n_threads=4,
+                n_batch=512,
+                device="cpu"
+            )
+        else:
+            shard_fn = partial(shard_model, device_id=device_id)
+            self.text_encoder = QuantizedT5EncoderModel(
+                text_len=config.text_len,
+                dtype=config.t5_dtype,
+                device=torch.device('cpu'),
+                checkpoint_path=os.path.join(checkpoint_dir, config.t5_checkpoint),
+                tokenizer_path=os.path.join(checkpoint_dir, config.t5_tokenizer),
+                shard_fn=shard_fn if t5_fsdp else None
+            )
 
         self.vae_stride = config.vae_stride
         self.patch_size = config.patch_size
