@@ -372,7 +372,7 @@ def generate(args):
             dit_fsdp=args.dit_fsdp,
             use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
             t5_cpu=args.t5_cpu,
-            quantized_weigths_dir = args.quantized_weights_dir
+            quantized_weights_dir = args.quantized_weights_dir
         )
 
         logging.info(

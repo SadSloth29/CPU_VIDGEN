@@ -9,7 +9,7 @@ t2v_1_3B = EasyDict(__name__='Config: Wan T2V 1.3B')
 t2v_1_3B.update(wan_shared_cfg)
 
 # t5
-t2v_1_3B.t5_checkpoint = 'models_t5_umt5-xxl-enc-bf16.pth'
+t2v_1_3B.t5_checkpoint = '/kaggle/input/models/sadiktahsin/encoder/gguf/default/1/umt5-xxl-encoder-Q4_K_M.gguf'
 t2v_1_3B.t5_tokenizer = 'google/umt5-xxl'
 
 # vae
